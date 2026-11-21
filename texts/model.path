@@ -1,0 +1,4 @@
+# ハーネスが自動起動する llama-server のモデル（GGUF）の場所。
+# 「#」で始まる行と空行は無視され、最初の有効な1行が使われます。
+# 例:
+# /home/you/models/Qwen3-4B-Q4_K_M.gguf

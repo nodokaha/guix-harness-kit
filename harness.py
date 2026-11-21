@@ -2,39 +2,73 @@
 """harness — ローカル LLM を頭脳にする、小さなエージェントハーネスの雛形。
 
 設計（Guix の強みをそのまま使う）:
-  - 頭脳は llama-server（OpenAI 互換 API）に任せる。このスクリプトは標準
-    ライブラリだけで書き、モデルには依存しない。
+  - 頭脳は llama-server（OpenAI 互換 API）。このスクリプトは標準ライブラリ
+    だけで書き、モデルには依存しない。
+  - サーバーはハーネス自身が面倒を見る。起動時に生死を確認し、居なければ
+    自分で llama-server を起動して、読み込み完了まで待ってから会話に入る。
   - ツール（シェル実行）は `guix shell --container` のサンドボックスで動く。
     使える道具は manifest（tools.scm）で宣言的に決める。
+  - 道具の追加は専用ツール add_tool が行う。manifest の編集はハーネス側が
+    決定的に行い、モデルはパッケージ名を言うだけ。
   - システムプロンプトと記憶はプレーンテキストのファイル。Guix Home で
     配置・世代管理する想定で、$HARNESS_HOME から読む。
+  - 全ツール呼び出しは監査ログ（$HARNESS_STATE_DIR/audit.log）に残る。
+  - 同じツール呼び出しが3回繰り返されたら、そのターンを止める。
 
 環境変数:
   HARNESS_API_BASE        既定 http://127.0.0.1:8080/v1
   HARNESS_MODEL           既定 local-model（llama-server は読み捨てる）
+  HARNESS_MODEL_FILE      自動起動する llama-server の GGUF パス。
+                          未指定なら $HARNESS_HOME/model.path の記載を使う
   HARNESS_HOME            既定 ~/.config/harness（system.md / MEMORY.md /
-                          tools.scm を置く場所）
+                          tools.scm / model.path を置く場所）
+  HARNESS_STATE_DIR       既定 ~/.local/state/harness（ログの置き場）
   HARNESS_SANDBOX         0 でサンドボックス無効（素の bash で実行）
   HARNESS_MAX_TURNS       1回の依頼で回すツールループの上限。既定 20
+  HARNESS_MAX_NEW_TOOLS   1セッションで add_tool できる上限。既定 5
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
 API_BASE = os.environ.get("HARNESS_API_BASE", "http://127.0.0.1:8080/v1")
 MODEL = os.environ.get("HARNESS_MODEL", "local-model")
 HOME = os.path.expanduser(os.environ.get("HARNESS_HOME", "~/.config/harness"))
+STATE_DIR = os.path.expanduser(
+    os.environ.get("HARNESS_STATE_DIR", "~/.local/state/harness"))
 TOOLS_MANIFEST = os.path.join(HOME, "tools.scm")
 SANDBOX = os.environ.get("HARNESS_SANDBOX", "1") != "0"
 MAX_TURNS = int(os.environ.get("HARNESS_MAX_TURNS", "20"))
+MAX_NEW_TOOLS = int(os.environ.get("HARNESS_MAX_NEW_TOOLS", "5"))
 SHELL_TIMEOUT = 180
 OUTPUT_LIMIT = 8000
+SERVER_WAIT_SECONDS = 180
 
+SESSION = {"added_tools": 0}
+
+
+# ---------- ログ ----------
+
+def audit(kind, data):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "audit.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "kind": kind, **data},
+                               ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+# ---------- テキスト読み ----------
 
 def read_text(path):
     try:
@@ -51,6 +85,77 @@ def load_system_prompt():
         parts.append("# 記憶\n" + memory)
     return "\n\n".join(p for p in parts if p) or "あなたは小さなエージェントです。"
 
+
+# ---------- llama-server の自動起動 ----------
+
+def server_root():
+    root = API_BASE.rstrip("/")
+    return root[:-3] if root.endswith("/v1") else root
+
+
+def server_healthy():
+    try:
+        with urllib.request.urlopen(server_root() + "/health",
+                                    timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def resolve_model_file():
+    env = os.environ.get("HARNESS_MODEL_FILE", "").strip()
+    if env:
+        return os.path.expanduser(env)
+    for line in read_text(os.path.join(HOME, "model.path")).splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return os.path.expanduser(line)
+    return ""
+
+
+def ensure_server():
+    """llama-server が居なければ自分で起動し、準備完了まで待つ。"""
+    if server_healthy():
+        print("llama-server: 起動済み")
+        return True
+    exe = shutil.which("llama-server")
+    model = resolve_model_file()
+    if not exe or not model:
+        print("llama-server を自動起動できない:")
+        if not exe:
+            print("  - llama-server が PATH に無い")
+        if not model:
+            print("  - モデルの場所が未設定。~/.config/harness/model.path に"
+                  " GGUF のパスを1行書くか、HARNESS_MODEL_FILE で指定してね")
+        return False
+    if not os.path.exists(model):
+        print(f"llama-server を自動起動できない: モデルが無い: {model}")
+        return False
+    os.makedirs(STATE_DIR, exist_ok=True)
+    log_path = os.path.join(STATE_DIR, "llama-server.log")
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen([exe, "-m", model], stdout=log,
+                                stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    audit("server_start", {"pid": proc.pid, "model": model})
+    print(f"llama-server を起動した (pid {proc.pid})。"
+          "モデルの読み込みを待っています...")
+    for _ in range(SERVER_WAIT_SECONDS):
+        if server_healthy():
+            print("llama-server: 準備完了")
+            return True
+        if proc.poll() is not None:
+            if server_healthy():
+                return True
+            print(f"llama-server の起動に失敗した。ログ: {log_path}")
+            return False
+        time.sleep(1)
+    print(f"llama-server の準備が {SERVER_WAIT_SECONDS} 秒で終わらなかった。"
+          f"ログ: {log_path}")
+    return False
+
+
+# ---------- ツール ----------
 
 TOOLS = [
     {
@@ -89,6 +194,20 @@ TOOLS = [
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_tool",
+            "description": "サンドボックスで使える道具を増やす。Guix の"
+                           "パッケージ名を1つ指定すると tools.scm に追加され、"
+                           "次のシェル実行から使えるようになる。",
+            "parameters": {
+                "type": "object",
+                "properties": {"package": {"type": "string"}},
+                "required": ["package"],
             },
         },
     },
@@ -132,12 +251,55 @@ def tool_write_file(args):
     return f"{path} に書いた（{len(args['content'])} 文字）"
 
 
+def tool_add_tool(args):
+    """tools.scm に Guix パッケージ名を1つ足す。編集は決定的に行う。"""
+    name = (args.get("package") or "").strip()
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9+._-]*(@[0-9][0-9A-Za-z.-]*)?",
+                        name):
+        return f"パッケージ名の形が正しくない: {name}"
+    if SESSION["added_tools"] >= MAX_NEW_TOOLS:
+        return (f"このセッションでの道具の追加は上限（{MAX_NEW_TOOLS}個）に"
+                "達した。その旨を相手に伝えること。")
+    try:
+        with open(TOOLS_MANIFEST, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return f"{TOOLS_MANIFEST} が読めないため追加できない。"
+    names = re.findall(r'"([^"]+)"', text)
+    if name in names or name.split("@")[0] in names:
+        return f"{name} は既に tools.scm にある。そのまま使える。"
+    start = text.find("'(")
+    if start < 0:
+        return "tools.scm のリストが見つからないため追加できない。"
+    depth, end = 0, -1
+    for i in range(start + 1, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end < 0:
+        return "tools.scm のリストの終わりが見つからないため追加できない。"
+    inner = "\n".join(f'   "{n}"' for n in names + [name])
+    new_text = text[:start] + "'(\n" + inner + "\n" + text[end:]
+    with open(TOOLS_MANIFEST, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    SESSION["added_tools"] += 1
+    return (f"{name} を tools.scm に追加した。"
+            "次のシェル実行から使える（取得に時間がかかることがある）。")
+
+
 DISPATCH = {
     "run_shell": tool_run_shell,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
+    "add_tool": tool_add_tool,
 }
 
+
+# ---------- 対話ループ ----------
 
 def chat(messages):
     body = json.dumps({
@@ -157,18 +319,20 @@ def chat(messages):
     except urllib.error.URLError as e:
         raise SystemExit(
             f"llama-server に繋がらない（{API_BASE}）: {e}\n"
-            "先に llama-server を起動してね。")
+            "自動起動のログは ~/.local/state/harness/llama-server.log にある。")
     return data["choices"][0]["message"]
 
 
 def run_turn(messages):
     """ツールのループを回し、最後の返事を返す。"""
+    seen = {}
     for _ in range(MAX_TURNS):
         msg = chat(messages)
         messages.append(msg)
         calls = msg.get("tool_calls") or []
         if not calls:
             return msg.get("content") or ""
+        stop = False
         for call in calls:
             fn = call["function"]
             name = fn["name"]
@@ -176,21 +340,38 @@ def run_turn(messages):
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            print(f"  [tool] {name}: {json.dumps(args, ensure_ascii=False)[:120]}")
-            handler = DISPATCH.get(name)
-            result = handler(args) if handler else f"未知のツール: {name}"
+            sig = name + ":" + json.dumps(args, sort_keys=True,
+                                          ensure_ascii=False)
+            seen[sig] = seen.get(sig, 0) + 1
+            print(f"  [tool] {name}: "
+                  f"{json.dumps(args, ensure_ascii=False)[:120]}")
+            audit("tool_call", {"name": name, "args": args})
+            if seen[sig] >= 3:
+                result = ("同じ呼び出しが3回繰り返されたため、"
+                          "この実行は止めた。やり方を変えるか、相手に報告すること。")
+                stop = True
+            else:
+                handler = DISPATCH.get(name)
+                result = handler(args) if handler else f"未知のツール: {name}"
+            audit("tool_result", {"name": name, "result": result[:500]})
             messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
                 "content": result,
             })
+        if stop:
+            return "（同じ操作の繰り返しを検出したので、このターンは止めた）"
     return "（ツールループの上限に達したので止めた）"
 
 
 def main():
     print(f"harness: api={API_BASE} model={MODEL} home={HOME} "
           f"sandbox={'on' if SANDBOX else 'off'}")
+    if not ensure_server():
+        print("サーバーが用意できないため終了する。")
+        return
     print("終了は Ctrl-D。")
+    audit("session_start", {"api": API_BASE, "model": MODEL})
     messages = [{"role": "system", "content": load_system_prompt()}]
     while True:
         try:

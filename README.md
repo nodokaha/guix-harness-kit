@@ -12,6 +12,7 @@
 | `texts/tools.scm` | サンドボックス用ツール manifest の雛形 |
 | `texts/system.md` | システムプロンプトの雛形 |
 | `texts/MEMORY.md` | 記憶テキストの雛形 |
+| `texts/model.path` | 自動起動する llama-server のモデル（GGUF）の場所 |
 
 ## Guix との対応
 
@@ -28,40 +29,46 @@
 
 ## 自己拡張ループ
 
-エージェントは、道具が足りなければ tools.scm に Guix パッケージ名を足して
-自分で道具を増やせる（手順は texts/system.md に記載）。サンドボックスは
-実行ごとに manifest から作り直されるため、本体を再起動せずに道具だけが
-世代交代する。tools.scm を git で管理しておけば、変更をいつでも戻せる。
+エージェントは、道具が足りなければ専用ツール `add_tool` で Guix パッケージを
+指定して道具を増やせる（手順は texts/system.md に記載）。manifest の編集は
+ハーネス側が決定的に行い、モデルは名前を言うだけ。サンドボックスは実行ごとに
+manifest から作り直されるため、本体を再起動せずに道具だけが世代交代する。
+追加は1セッション最大5個まで。tools.scm を git で管理しておけば戻せる。
+
+## サーバーの自動起動
+
+ハーネスは起動時に llama-server の生死を確認し、居なければ自分で起動して
+読み込み完了まで待つ。モデルの場所は `~/.config/harness/model.path` に
+1行で書く。サーバーはハーネスを終了しても残る（止めるときは
+`pkill llama-server`）。サーバーの出力と監査ログは
+`~/.local/state/harness/` に残る。
 
 ## 使い方
 
-1. テキスト類を配置する:
+1. テキスト類を配置し、model.path に自分のモデルのパスを書く:
 
    ```
    mkdir -p ~/.config/harness
-   cp texts/tools.scm texts/system.md texts/MEMORY.md ~/.config/harness/
+   cp texts/tools.scm texts/system.md texts/MEMORY.md texts/model.path ~/.config/harness/
+   # ~/.config/harness/model.path の例の行を、実際の GGUF パスに書き換える
    ```
 
-2. シェルに入る（llama-server と harness の両方が PATH に並ぶ）:
+2. ハーネスを起動する（サーバーは自動で立つ）:
 
    ```
-   guix shell -f harness.scm
-   ```
-
-3. 端末1で llama-server、端末2でハーネスを起動する（モデルは好きな GGUF を）:
-
-   ```
-   llama-server -m Qwen3-30B-A3B-Q4_K_M.gguf
-   harness
+   guix shell -f harness.scm -- harness
    ```
 
 ## 環境変数
 
 - `HARNESS_API_BASE` — 既定 `http://127.0.0.1:8080/v1`
 - `HARNESS_MODEL` — 既定 `local-model`
+- `HARNESS_MODEL_FILE` — 自動起動するモデルの GGUF パス（model.path より優先）
 - `HARNESS_HOME` — 既定 `~/.config/harness`
+- `HARNESS_STATE_DIR` — 既定 `~/.local/state/harness`
 - `HARNESS_SANDBOX=0` — サンドボックスを切って素の bash で実行
 - `HARNESS_MAX_TURNS` — ツールループの上限。既定 20
+- `HARNESS_MAX_NEW_TOOLS` — 1セッションの道具追加の上限。既定 5
 
 ## 次に育てる候補
 
