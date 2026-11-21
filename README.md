@@ -38,8 +38,9 @@ manifest から作り直されるため、本体を再起動せずに道具だ�
 ## サーバーの自動起動
 
 ハーネスは起動時に llama-server の生死を確認し、居なければ自分で起動して
-読み込み完了まで待つ。モデルの場所は `~/.config/harness/model.path` に
-1行で書く。サーバーはハーネスを終了しても残る（止めるときは
+読み込み完了まで待つ。モデルの場所は `~/.config/harness/model.path` に書く
+（1行目がモデル本体、2行目に mmproj を書くと vision モデルで起動する）。
+サーバーはハーネスを終了しても残る（止めるときは
 `pkill llama-server`）。サーバーの出力と監査ログは
 `~/.local/state/harness/` に残る。
 
@@ -64,6 +65,7 @@ manifest から作り直されるため、本体を再起動せずに道具だ�
 - `HARNESS_API_BASE` — 既定 `http://127.0.0.1:8080/v1`
 - `HARNESS_MODEL` — 既定 `local-model`
 - `HARNESS_MODEL_FILE` — 自動起動するモデルの GGUF パス（model.path より優先）
+- `HARNESS_MMPROJ_FILE` — mmproj の GGUF パス（model.path の2行目より優先）
 - `HARNESS_HOME` — 既定 `~/.config/harness`
 - `HARNESS_STATE_DIR` — 既定 `~/.local/state/harness`
 - `HARNESS_SANDBOX=0` — サンドボックスを切って素の bash で実行

@@ -1,4 +1,9 @@
-# ハーネスが自動起動する llama-server のモデル（GGUF）の場所。
-# 「#」で始まる行と空行は無視され、最初の有効な1行が使われます。
-# 例:
+# ハーネスが自動起動する llama-server のモデルの場所。
+# 「#」で始まる行と空行は無視されます。
+#   1行目: モデル本体（GGUF）
+#   2行目: mmproj（GGUF、任意。vision モデルを使うときだけ）
+# 例（テキストモデル）:
 # /home/you/models/Qwen3-4B-Q4_K_M.gguf
+# 例（vision モデル）:
+# /home/you/models/Qwen3VL-4B-Instruct-Q4_K_M.gguf
+# /home/you/models/mmproj-Qwen3VL-4B-Instruct-F16.gguf

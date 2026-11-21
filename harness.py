@@ -20,6 +20,8 @@
   HARNESS_MODEL           既定 local-model（llama-server は読み捨てる）
   HARNESS_MODEL_FILE      自動起動する llama-server の GGUF パス。
                           未指定なら $HARNESS_HOME/model.path の記載を使う
+  HARNESS_MMPROJ_FILE     vision モデル用の mmproj の GGUF パス。
+                          未指定なら model.path の2行目を使う
   HARNESS_HOME            既定 ~/.config/harness（system.md / MEMORY.md /
                           tools.scm / model.path を置く場所）
   HARNESS_STATE_DIR       既定 ~/.local/state/harness（ログの置き場）
@@ -102,15 +104,30 @@ def server_healthy():
         return False
 
 
+def model_config_lines():
+    """model.path の有効な行（コメントと空行を除く）を順に返す。"""
+    lines = []
+    for line in read_text(os.path.join(HOME, "model.path")).splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            lines.append(line)
+    return lines
+
+
 def resolve_model_file():
     env = os.environ.get("HARNESS_MODEL_FILE", "").strip()
     if env:
         return os.path.expanduser(env)
-    for line in read_text(os.path.join(HOME, "model.path")).splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            return os.path.expanduser(line)
-    return ""
+    lines = model_config_lines()
+    return os.path.expanduser(lines[0]) if lines else ""
+
+
+def resolve_mmproj_file():
+    env = os.environ.get("HARNESS_MMPROJ_FILE", "").strip()
+    if env:
+        return os.path.expanduser(env)
+    lines = model_config_lines()
+    return os.path.expanduser(lines[1]) if len(lines) > 1 else ""
 
 
 def ensure_server():
@@ -131,13 +148,21 @@ def ensure_server():
     if not os.path.exists(model):
         print(f"llama-server を自動起動できない: モデルが無い: {model}")
         return False
+    mmproj = resolve_mmproj_file()
+    server_args = [exe, "-m", model]
+    if mmproj:
+        if not os.path.exists(mmproj):
+            print(f"llama-server を自動起動できない: mmproj が無い: {mmproj}")
+            return False
+        server_args += ["--mmproj", mmproj]
     os.makedirs(STATE_DIR, exist_ok=True)
     log_path = os.path.join(STATE_DIR, "llama-server.log")
     with open(log_path, "ab") as log:
-        proc = subprocess.Popen([exe, "-m", model], stdout=log,
+        proc = subprocess.Popen(server_args, stdout=log,
                                 stderr=subprocess.STDOUT,
                                 start_new_session=True)
-    audit("server_start", {"pid": proc.pid, "model": model})
+    audit("server_start", {"pid": proc.pid, "model": model,
+                           "mmproj": mmproj})
     print(f"llama-server を起動した (pid {proc.pid})。"
           "モデルの読み込みを待っています...")
     for _ in range(SERVER_WAIT_SECONDS):
