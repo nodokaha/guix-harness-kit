@@ -21,4 +21,5 @@
    "git"
    "curl"
    "python"
+   "procps"
    "openssh"))
