@@ -64,6 +64,33 @@ SERVER_WAIT_SECONDS = 180
 
 SESSION = {"added_tools": 0}
 
+# tools.scm の雛形（texts/tools.scm と同じ内容）。配置し忘れても
+# ハーネスが自分で置けるように、本体にも持っておく。
+DEFAULT_MANIFEST = """\
+(specifications->manifest
+ '("bash"
+   "coreutils"
+   "findutils"
+   "diffutils"
+   "grep"
+   "sed"
+   "gawk"
+   "git"
+   "curl"
+   "python"
+   "openssh"))
+"""
+
+
+def ensure_manifest():
+    """tools.scm が無ければ雛形を作成する。作成したら True。"""
+    if os.path.exists(TOOLS_MANIFEST):
+        return False
+    os.makedirs(HOME, exist_ok=True)
+    with open(TOOLS_MANIFEST, "w", encoding="utf-8") as f:
+        f.write(DEFAULT_MANIFEST)
+    return True
+
 
 # ---------- ログ ----------
 
@@ -307,6 +334,7 @@ def tool_add_tool(args):
     if SESSION["added_tools"] >= MAX_NEW_TOOLS:
         return (f"このセッションでの道具の追加は上限（{MAX_NEW_TOOLS}個）に"
                 "達した。その旨を相手に伝えること。")
+    created = ensure_manifest()
     try:
         with open(TOOLS_MANIFEST, encoding="utf-8") as f:
             text = f.read()
@@ -314,7 +342,8 @@ def tool_add_tool(args):
         return f"{TOOLS_MANIFEST} が読めないため追加できない。"
     names = re.findall(r'"([^"]+)"', text)
     if name in names or name.split("@")[0] in names:
-        return f"{name} は既に tools.scm にある。そのまま使える。"
+        note = "tools.scm が無かったので雛形を作成した。" if created else ""
+        return f"{note}{name} は既に tools.scm にある。そのまま使える。"
     start = text.find("'(")
     if start < 0:
         return "tools.scm のリストが見つからないため追加できない。"
@@ -334,7 +363,8 @@ def tool_add_tool(args):
     with open(TOOLS_MANIFEST, "w", encoding="utf-8") as f:
         f.write(new_text)
     SESSION["added_tools"] += 1
-    return (f"{name} を tools.scm に追加した。"
+    note = "tools.scm が無かったので雛形を作成した。" if created else ""
+    return (f"{note}{name} を tools.scm に追加した。"
             "次のシェル実行から使える（取得に時間がかかることがある）。")
 
 
@@ -438,6 +468,13 @@ def run_turn(messages):
 def main():
     print(f"harness: api={API_BASE} model={MODEL} home={HOME} "
           f"sandbox={'on' if SANDBOX else 'off'}")
+    if ensure_manifest():
+        print(f"tools.scm が無かったので雛形を作成した: {TOOLS_MANIFEST}")
+    missing = [n for n in ("system.md", "MEMORY.md", "model.path")
+               if not os.path.exists(os.path.join(HOME, n))]
+    if missing:
+        print(f"（{HOME} に無いファイル: {', '.join(missing)}。"
+              "texts/ からコピーすると使える）")
     if not ensure_server():
         print("サーバーが用意できないため終了する。")
         return
