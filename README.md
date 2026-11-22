@@ -81,6 +81,12 @@ Qwen3 系の思考モードは、リクエスト側で `enable_thinking=false` �
 - `HARNESS_MAX_NEW_TOOLS` — 1セッションの道具追加の上限。既定 5
 - `HARNESS_SERVER_ARGS` — 自動起動時に llama-server へ渡す追加の引数
 - `HARNESS_NO_THINK=0` — Qwen3 系の思考モードを有効に戻す（既定は無効）
+- `HARNESS_SHELL_TIMEOUT` — シェル実行1回の制限時間（秒）。既定 600
+
+起動時は、サーバーの用意のあとにサンドボックス環境の構築（ウォーム
+アップ）を先に済ませる。manifest が変わった直後の初回構築は数分かかる
+ことがあるが、ターンの途中で黙って待たせる代わりに、ここで進捗と
+所要時間を表示する。
 
 ## 次に育てる候補
 

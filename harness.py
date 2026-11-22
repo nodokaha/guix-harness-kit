@@ -34,6 +34,9 @@
   HARNESS_NO_THINK        0 で Qwen3 系の思考モードを有効に戻す。
                           既定は無効（応答速度優先。chat_template_kwargs で
                           enable_thinking=false を送る）
+  HARNESS_SHELL_TIMEOUT   シェル実行1回の制限時間（秒）。既定 600。
+                          初回の環境構築や道具の取得は数分かかることが
+                          あるため、短すぎると途中で打ち切られる
 """
 
 import json
@@ -58,7 +61,7 @@ SANDBOX = os.environ.get("HARNESS_SANDBOX", "1") != "0"
 MAX_TURNS = int(os.environ.get("HARNESS_MAX_TURNS", "20"))
 MAX_NEW_TOOLS = int(os.environ.get("HARNESS_MAX_NEW_TOOLS", "5"))
 NO_THINK = os.environ.get("HARNESS_NO_THINK", "1") != "0"
-SHELL_TIMEOUT = 180
+SHELL_TIMEOUT = int(os.environ.get("HARNESS_SHELL_TIMEOUT", "600"))
 OUTPUT_LIMIT = 8000
 SERVER_WAIT_SECONDS = 180
 
@@ -306,14 +309,17 @@ def sandbox_wrap(command):
 
 def tool_run_shell(args):
     cmd = sandbox_wrap(args["command"])
+    started = time.time()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=SHELL_TIMEOUT)
         out = (proc.stdout or "") + (proc.stderr or "")
         return (out or "(出力なし)")[:OUTPUT_LIMIT] + \
-            f"\n[exit {proc.returncode}]"
+            f"\n[exit {proc.returncode}, {time.time() - started:.1f}秒]"
     except subprocess.TimeoutExpired:
-        return f"タイムアウト（{SHELL_TIMEOUT}秒）"
+        return (f"タイムアウト（{SHELL_TIMEOUT}秒）。"
+                "環境の構築や道具の取得が途中なら、同じコマンドをもう一度"
+                "実行すると続きから進むことが多い。")
 
 
 def tool_read_file(args):
@@ -468,6 +474,32 @@ def run_turn(messages):
     return "（ツールループの上限に達したので止めた）"
 
 
+def warmup_sandbox():
+    """サンドボックス環境の構築を起動時に済ませる。
+
+    manifest が変わった直後の guix shell は、環境の構築（取得やビルド）に
+    数分かかることがある。それをターンの途中で黙って待たせると固まった
+    ように見えるため、起動時に進捗を見せながら先に済ませる。
+    """
+    if not (SANDBOX and shutil.which("guix")
+            and os.path.exists(TOOLS_MANIFEST)):
+        return
+    print("サンドボックスの環境を準備しています"
+          "（初回や道具の追加直後は数分かかることがあります）...")
+    started = time.time()
+    try:
+        proc = subprocess.run(sandbox_wrap("true"), capture_output=True,
+                              text=True, timeout=SHELL_TIMEOUT)
+        if proc.returncode == 0:
+            print(f"サンドボックス準備完了（{time.time() - started:.0f}秒）")
+        else:
+            tail = ((proc.stdout or "") + (proc.stderr or ""))[-500:]
+            print(f"サンドボックスの準備でエラーが出た（続行はする）:\n{tail}")
+    except subprocess.TimeoutExpired:
+        print(f"サンドボックスの準備が {SHELL_TIMEOUT} 秒で終わらなかった"
+              "（続行はする。初回の実行は遅くなる）")
+
+
 def main():
     print(f"harness: api={API_BASE} model={MODEL} home={HOME} "
           f"sandbox={'on' if SANDBOX else 'off'}")
@@ -481,6 +513,7 @@ def main():
     if not ensure_server():
         print("サーバーが用意できないため終了する。")
         return
+    warmup_sandbox()
     print("終了は Ctrl-D。")
     audit("session_start", {"api": API_BASE, "model": MODEL})
     messages = [{"role": "system", "content": load_system_prompt()}]
