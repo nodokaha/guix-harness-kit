@@ -46,6 +46,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -220,7 +221,7 @@ def ensure_server():
                            "mmproj": mmproj})
     print(f"llama-server を起動した (pid {proc.pid})。"
           "モデルの読み込みを待っています...")
-    for _ in range(SERVER_WAIT_SECONDS):
+    for waited in range(SERVER_WAIT_SECONDS):
         if server_healthy():
             print("llama-server: 準備完了")
             return True
@@ -230,6 +231,8 @@ def ensure_server():
             print(f"llama-server の起動に失敗した。ログ: {log_path}")
             return False
         time.sleep(1)
+        if (waited + 1) % 15 == 0:
+            print(f"  ...読み込み中（{waited + 1}秒）")
     print(f"llama-server の準備が {SERVER_WAIT_SECONDS} 秒で終わらなかった。"
           f"ログ: {log_path}")
     return False
@@ -307,19 +310,60 @@ def sandbox_wrap(command):
     return ["bash", "-c", command]
 
 
+def run_with_spinner(cmd, timeout):
+    """コマンドを実行し、待つ間はスピナーと経過秒数を表示する。
+
+    (returncode, stdout, stderr) を返す。タイムアウト時は None。
+    出力はモデルへ渡すため捕捉するが、その間も画面が止まって見えない
+    ように、スピナーを回し続ける。
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    chunks = {"out": [], "err": []}
+
+    def drain(stream, key):
+        chunks[key].append(stream.read() or "")
+
+    threads = [threading.Thread(target=drain, args=(proc.stdout, "out"),
+                                 daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, "err"),
+                                 daemon=True)]
+    for t in threads:
+        t.start()
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    started = time.time()
+    i = 0
+    try:
+        while proc.poll() is None:
+            if time.time() - started > timeout:
+                proc.kill()
+                proc.wait()
+                return None
+            sys.stdout.write(f"\r{frames[i % len(frames)]} 実行中... "
+                             f"{time.time() - started:.0f}秒")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.2)
+    finally:
+        sys.stdout.write("\r" + " " * 40 + "\r")
+        sys.stdout.flush()
+    for t in threads:
+        t.join()
+    return proc.returncode, "".join(chunks["out"]), "".join(chunks["err"])
+
+
 def tool_run_shell(args):
     cmd = sandbox_wrap(args["command"])
     started = time.time()
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=SHELL_TIMEOUT)
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return (out or "(出力なし)")[:OUTPUT_LIMIT] + \
-            f"\n[exit {proc.returncode}, {time.time() - started:.1f}秒]"
-    except subprocess.TimeoutExpired:
+    res = run_with_spinner(cmd, SHELL_TIMEOUT)
+    if res is None:
         return (f"タイムアウト（{SHELL_TIMEOUT}秒）。"
                 "環境の構築や道具の取得が途中なら、同じコマンドをもう一度"
                 "実行すると続きから進むことが多い。")
+    returncode, out_s, err_s = res
+    out = out_s + err_s
+    return (out or "(出力なし)")[:OUTPUT_LIMIT] + \
+        f"\n[exit {returncode}, {time.time() - started:.1f}秒]"
 
 
 def tool_read_file(args):
@@ -488,13 +532,15 @@ def warmup_sandbox():
           "（初回や道具の追加直後は数分かかることがあります）...")
     started = time.time()
     try:
-        proc = subprocess.run(sandbox_wrap("true"), capture_output=True,
-                              text=True, timeout=SHELL_TIMEOUT)
+        # 出力は捕捉せず端末へそのまま流す。guix 自身の進捗表示
+        # （取得やビルドのバー）がそのまま見えるようにするため。
+        proc = subprocess.run(sandbox_wrap("true"),
+                              timeout=SHELL_TIMEOUT)
         if proc.returncode == 0:
             print(f"サンドボックス準備完了（{time.time() - started:.0f}秒）")
         else:
-            tail = ((proc.stdout or "") + (proc.stderr or ""))[-500:]
-            print(f"サンドボックスの準備でエラーが出た（続行はする）:\n{tail}")
+            print("サンドボックスの準備でエラーが出た（続行はする）。"
+                  "上の guix の出力を確認してね")
     except subprocess.TimeoutExpired:
         print(f"サンドボックスの準備が {SHELL_TIMEOUT} 秒で終わらなかった"
               "（続行はする。初回の実行は遅くなる）")
