@@ -483,6 +483,7 @@ def chat(messages):
     frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     spin = 0
     status_shown = False
+    last_status = 0.0
     while True:
         try:
             item = lines.get(timeout=0.2)
@@ -495,6 +496,7 @@ def chat(messages):
                 sys.stdout.flush()
                 spin += 1
                 status_shown = True
+                last_status = time.time()
             continue
         if item is None:
             break
@@ -548,6 +550,20 @@ def chat(messages):
             fn = tc.get("function") or {}
             entry["name"] += fn.get("name") or ""
             entry["arguments"] += fn.get("arguments") or ""
+        # チャンクが途切れず届く間は queue.Empty が起きないため、上の
+        # 表示更新が走らず秒数が止まって見える（内容は画面に出さず溜め
+        # ているので、生成が進んでいても固まったように見える）。生成中
+        # も 0.2 秒ごとに表示を更新する。思考を表示中は文字が流れて
+        # いるので更新しない。
+        if not printed_reasoning and time.time() - last_status >= 0.2:
+            elapsed = time.time() - started
+            label = "考え中" if first_token_at is None else "生成中"
+            sys.stdout.write(f"\r{frames[spin % len(frames)]} {label}... "
+                             f"{elapsed:.0f}秒")
+            sys.stdout.flush()
+            spin += 1
+            status_shown = True
+            last_status = time.time()
     if status_shown:
         sys.stdout.write("\r" + " " * 40 + "\r")
         sys.stdout.flush()
