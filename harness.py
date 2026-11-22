@@ -13,7 +13,8 @@
   - システムプロンプトと記憶はプレーンテキストのファイル。Guix Home で
     配置・世代管理する想定で、$HARNESS_HOME から読む。
   - 全ツール呼び出しは監査ログ（$HARNESS_STATE_DIR/audit.log）に残る。
-  - 同じツール呼び出しが3回繰り返されたら、そのターンを止める。
+  - 同じ呼び出しで同じ結果が続いたらモデルに警告し、それでも同じ
+    呼び出しが来たら、そのターンを止める（結果が変われば数えない）。
 
 環境変数:
   HARNESS_API_BASE        既定 http://127.0.0.1:8080/v1
@@ -375,7 +376,13 @@ def chat(messages):
 
 
 def run_turn(messages):
-    """ツールのループを回し、最後の返事を返す。"""
+    """ツールのループを回し、最後の返事を返す。
+
+    ループ検出は「同じ引数で呼んで、同じ結果が返った」場合だけ数える。
+    結果が変わる繰り返し（状態を見ながらの再実行など）は正当なので
+    数えない。同じ結果が3回続いたら結果に警告を付け、それでも同じ
+    呼び出しが来たらターンを止める。
+    """
     seen = {}
     for _ in range(MAX_TURNS):
         msg = chat(messages)
@@ -393,17 +400,30 @@ def run_turn(messages):
                 args = {}
             sig = name + ":" + json.dumps(args, sort_keys=True,
                                           ensure_ascii=False)
-            seen[sig] = seen.get(sig, 0) + 1
             print(f"  [tool] {name}: "
                   f"{json.dumps(args, ensure_ascii=False)[:120]}")
             audit("tool_call", {"name": name, "args": args})
-            if seen[sig] >= 3:
-                result = ("同じ呼び出しが3回繰り返されたため、"
-                          "この実行は止めた。やり方を変えるか、相手に報告すること。")
+            entry = seen.setdefault(sig, {"result": None, "same": 0,
+                                          "warned": False})
+            if entry["warned"]:
+                result = ("同じ呼び出しが警告のあとも繰り返されたため、"
+                          "このターンは止めた。")
                 stop = True
             else:
                 handler = DISPATCH.get(name)
                 result = handler(args) if handler else f"未知のツール: {name}"
+                if result == entry["result"]:
+                    entry["same"] += 1
+                else:
+                    entry["same"] = 0
+                    entry["warned"] = False
+                entry["result"] = result
+                if entry["same"] >= 2 and not entry["warned"]:
+                    entry["warned"] = True
+                    result += ("\n[ハーネスからの注意] この呼び出しは同じ"
+                               "結果が続いている。次に同じ呼び出しをしたら"
+                               "ターンを止める。別のやり方に変えるか、"
+                               "できない理由を相手に伝えること。")
             audit("tool_result", {"name": name, "result": result[:500]})
             messages.append({
                 "role": "tool",
@@ -411,7 +431,7 @@ def run_turn(messages):
                 "content": result,
             })
         if stop:
-            return "（同じ操作の繰り返しを検出したので、このターンは止めた）"
+            return "（同じ操作の繰り返しが警告後も続いたので、このターンは止めた）"
     return "（ツールループの上限に達したので止めた）"
 
 
