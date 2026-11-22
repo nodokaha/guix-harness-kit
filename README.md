@@ -44,6 +44,16 @@ manifest から作り直されるため、本体を再起動せずに道具だ�
 `pkill llama-server`）。サーバーの出力と監査ログは
 `~/.local/state/harness/` に残る。
 
+自動起動の引数は速度寄りに固定してある: 待ち受けは `HARNESS_API_BASE` の
+ホストとポートを明示し、全レイヤーを GPU に載せ（`-ngl 99`）、flash
+attention を有効にし、文脈は 8192、テンプレートは jinja 評価にする。
+追加の引数は `HARNESS_SERVER_ARGS` で末尾に足せる。手動でサーバーを
+立てる場合も、同じ引数で立てること（特にポートは 8080 を明示する）。
+
+Qwen3 系の思考モードは、リクエスト側で `enable_thinking=false` を送って
+既定で切る（ターンのたびに思考トレースを生成すると応答が大きく遅れる）。
+思考が欲しいときは `HARNESS_NO_THINK=0`。
+
 ## 使い方
 
 1. テキスト類を配置し、model.path に自分のモデルのパスを書く:
@@ -71,6 +81,8 @@ manifest から作り直されるため、本体を再起動せずに道具だ�
 - `HARNESS_SANDBOX=0` — サンドボックスを切って素の bash で実行
 - `HARNESS_MAX_TURNS` — ツールループの上限。既定 20
 - `HARNESS_MAX_NEW_TOOLS` — 1セッションの道具追加の上限。既定 5
+- `HARNESS_SERVER_ARGS` — 自動起動時に llama-server へ渡す追加の引数
+- `HARNESS_NO_THINK=0` — Qwen3 系の思考モードを有効に戻す（既定は無効）
 
 ## 次に育てる候補
 

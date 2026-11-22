@@ -28,16 +28,23 @@
   HARNESS_SANDBOX         0 でサンドボックス無効（素の bash で実行）
   HARNESS_MAX_TURNS       1回の依頼で回すツールループの上限。既定 20
   HARNESS_MAX_NEW_TOOLS   1セッションで add_tool できる上限。既定 5
+  HARNESS_SERVER_ARGS     自動起動時に llama-server へ渡す追加の引数
+                          （空白区切り。そのまま末尾に足される）
+  HARNESS_NO_THINK        0 で Qwen3 系の思考モードを有効に戻す。
+                          既定は無効（応答速度優先。chat_template_kwargs で
+                          enable_thinking=false を送る）
 """
 
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API_BASE = os.environ.get("HARNESS_API_BASE", "http://127.0.0.1:8080/v1")
@@ -49,6 +56,7 @@ TOOLS_MANIFEST = os.path.join(HOME, "tools.scm")
 SANDBOX = os.environ.get("HARNESS_SANDBOX", "1") != "0"
 MAX_TURNS = int(os.environ.get("HARNESS_MAX_TURNS", "20"))
 MAX_NEW_TOOLS = int(os.environ.get("HARNESS_MAX_NEW_TOOLS", "5"))
+NO_THINK = os.environ.get("HARNESS_NO_THINK", "1") != "0"
 SHELL_TIMEOUT = 180
 OUTPUT_LIMIT = 8000
 SERVER_WAIT_SECONDS = 180
@@ -149,12 +157,25 @@ def ensure_server():
         print(f"llama-server を自動起動できない: モデルが無い: {model}")
         return False
     mmproj = resolve_mmproj_file()
-    server_args = [exe, "-m", model]
+    parsed = urllib.parse.urlparse(server_root())
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8080
+    # ポートとホストは HARNESS_API_BASE に合わせて明示する（サーバー側の
+    # 既定に任せると、待ち受けポートがずれて生死確認が外れる）。
+    # 速度の既定: 全レイヤーを GPU へ、flash attention、文脈は作業用に
+    # 8192、テンプレートは jinja で評価する（思考オフの指定に必要）。
+    server_args = [exe, "-m", model,
+                   "--host", host, "--port", str(port),
+                   "-ngl", "99", "--flash-attn", "on",
+                   "-c", "8192", "--jinja"]
     if mmproj:
         if not os.path.exists(mmproj):
             print(f"llama-server を自動起動できない: mmproj が無い: {mmproj}")
             return False
         server_args += ["--mmproj", mmproj]
+    extra = os.environ.get("HARNESS_SERVER_ARGS", "").strip()
+    if extra:
+        server_args += shlex.split(extra)
     os.makedirs(STATE_DIR, exist_ok=True)
     log_path = os.path.join(STATE_DIR, "llama-server.log")
     with open(log_path, "ab") as log:
@@ -327,12 +348,17 @@ DISPATCH = {
 # ---------- 対話ループ ----------
 
 def chat(messages):
-    body = json.dumps({
+    payload = {
         "model": MODEL,
         "messages": messages,
         "tools": TOOLS,
         "tool_choice": "auto",
-    }).encode()
+    }
+    if NO_THINK:
+        # Qwen3 系の思考モードを切る。思考トレースはエージェントの
+        # ターンごとに数百トークンの待ち時間になるため、既定で切る。
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         API_BASE.rstrip("/") + "/chat/completions",
         data=body,
