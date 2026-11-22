@@ -41,6 +41,7 @@
 
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -432,11 +433,21 @@ DISPATCH = {
 # ---------- 対話ループ ----------
 
 def chat(messages):
+    """llama-server にストリーミングで問い合わせ、思考ログを出す。
+
+    応答を少しずつ受け取りながら、待ち時間には「考え中... ○秒」の
+    状態表示を更新する。思考トークン（reasoning_content）が流れて
+    きたら [思考] としてその場で表示する。最後に、最初のトークン
+    までの秒数・生成秒数・トークン数・速度を [思考ログ] として
+    1行出し、監査ログにも残す。
+    """
     payload = {
         "model": MODEL,
         "messages": messages,
         "tools": TOOLS,
         "tool_choice": "auto",
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
     if NO_THINK:
         # Qwen3 系の思考モードを切る。思考トレースはエージェントの
@@ -448,14 +459,131 @@ def chat(messages):
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            data = json.load(resp)
-    except urllib.error.URLError as e:
-        raise SystemExit(
-            f"llama-server に繋がらない（{API_BASE}）: {e}\n"
-            "自動起動のログは ~/.local/state/harness/llama-server.log にある。")
-    return data["choices"][0]["message"]
+    lines = queue.Queue()
+
+    def reader():
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                for raw in resp:
+                    lines.put(raw)
+        except Exception as e:  # 接続エラーは本体側で報告する
+            lines.put(e)
+        lines.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    started = time.time()
+    first_token_at = None
+    content_parts = []
+    reasoning_parts = []
+    tool_calls = {}
+    usage = {}
+    timings = {}
+    chunks = 0
+    printed_reasoning = False
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    spin = 0
+    status_shown = False
+    while True:
+        try:
+            item = lines.get(timeout=0.2)
+        except queue.Empty:
+            if not printed_reasoning:
+                elapsed = time.time() - started
+                label = "考え中" if first_token_at is None else "生成中"
+                sys.stdout.write(f"\r{frames[spin % len(frames)]} {label}... "
+                                 f"{elapsed:.0f}秒")
+                sys.stdout.flush()
+                spin += 1
+                status_shown = True
+            continue
+        if item is None:
+            break
+        if isinstance(item, Exception):
+            raise SystemExit(
+                f"llama-server に繋がらない（{API_BASE}）: {item}\n"
+                "自動起動のログは ~/.local/state/harness/llama-server.log "
+                "にある。")
+        line = item.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data_str = line[len("data:"):].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        if chunk.get("timings"):
+            timings = chunk["timings"]
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        reasoning = delta.get("reasoning_content") or ""
+        content = delta.get("content") or ""
+        if reasoning or content or delta.get("tool_calls"):
+            if first_token_at is None:
+                first_token_at = time.time()
+            chunks += 1
+        if reasoning:
+            if status_shown:
+                sys.stdout.write("\r" + " " * 40 + "\r")
+                status_shown = False
+            if not printed_reasoning:
+                sys.stdout.write("\n  [思考] ")
+                printed_reasoning = True
+            sys.stdout.write(reasoning)
+            sys.stdout.flush()
+            reasoning_parts.append(reasoning)
+        if content:
+            content_parts.append(content)
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            entry = tool_calls.setdefault(
+                idx, {"id": "", "name": "", "arguments": ""})
+            if tc.get("id"):
+                entry["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            entry["name"] += fn.get("name") or ""
+            entry["arguments"] += fn.get("arguments") or ""
+    if status_shown:
+        sys.stdout.write("\r" + " " * 40 + "\r")
+        sys.stdout.flush()
+    if printed_reasoning:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    ended = time.time()
+    ttft = (first_token_at - started) if first_token_at else ended - started
+    gen = (ended - first_token_at) if first_token_at else 0.0
+    tokens = usage.get("completion_tokens") or timings.get("predicted_n")
+    tps = (tokens / gen) if tokens and gen > 0 else None
+    summary = (f"  [思考ログ] 最初のトークンまで {ttft:.1f}秒 / "
+               f"生成 {gen:.1f}秒")
+    if tokens:
+        summary += f" / {tokens}トークン"
+    if tps:
+        summary += f" / {tps:.1f} tok/s"
+    reasoning_text = "".join(reasoning_parts)
+    if reasoning_text:
+        summary += f" / 思考 {len(reasoning_text)}文字"
+    print(summary)
+    audit("llm_turn", {"ttft_s": round(ttft, 2), "gen_s": round(gen, 2),
+                       "tokens": tokens,
+                       "tok_per_s": round(tps, 1) if tps else None,
+                       "reasoning_chars": len(reasoning_text),
+                       "chunks": chunks})
+    message = {"role": "assistant",
+               "content": "".join(content_parts) or None}
+    if tool_calls:
+        message["tool_calls"] = [
+            {"id": tool_calls[i]["id"] or f"call_{i}",
+             "type": "function",
+             "function": {"name": tool_calls[i]["name"],
+                          "arguments": tool_calls[i]["arguments"]}}
+            for i in sorted(tool_calls)]
+    return message
 
 
 def run_turn(messages):
