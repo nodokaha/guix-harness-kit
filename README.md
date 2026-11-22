@@ -56,19 +56,17 @@ Qwen3 系の思考モードは、リクエスト側で `enable_thinking=false` �
 
 ## 使い方
 
-1. テキスト類を配置し、model.path に自分のモデルのパスを書く:
-
-   ```
-   mkdir -p ~/.config/harness
-   cp texts/tools.scm texts/system.md texts/MEMORY.md texts/model.path ~/.config/harness/
-   # ~/.config/harness/model.path の例の行を、実際の GGUF パスに書き換える
-   ```
-
-2. ハーネスを起動する（サーバーは自動で立つ）:
+1. ハーネスを起動する（サーバーは自動で立つ）:
 
    ```
    guix shell -f harness.scm -- harness
    ```
+
+   初回起動時に、`~/.config/harness/` へ初期ファイル一式
+   （tools.scm / system.md / MEMORY.md / model.path）が自動でそろう。
+   あとは model.path に自分のモデルのパスを書けばよい。既にある
+   ファイルは上書きしない。Guix Home で管理したい場合は、texts/ の
+   ファイルを自分で配置してもよい（その場合はそちらが使われる）。
 
 ## 環境変数
 
